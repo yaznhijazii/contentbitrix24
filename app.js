@@ -32,6 +32,28 @@ const FIELDS = {
 };
 
 /* ═══════════════════════════════════════════════════════
+   ASSIGNEE MAP  (Bitrix24 user IDs per subject / unit keyword)
+   Fields set: assignedById  +  ufCrm160_1755078076
+═══════════════════════════════════════════════════════ */
+const ASSIGNEE_MAP = {
+  // Direct match by subject name (lowercase)
+  bySubject: {
+    'math':         163546, // Ibrahim
+    'biology':      163545, // Ranya
+    'earth science': 21921, // Mouth
+    'physics':      193663, // Zaatareh
+    'chemistry':    192276, // Minwer
+  },
+  // Fallback: scan unit text for Arabic sub-subject keywords (used when subject = "Science")
+  byUnitKeyword: [
+    { pattern: /أحياء/,              id: 163545 }, // Ranya   – Biology
+    { pattern: /علوم\s*أرض|أرض/,    id: 21921  }, // Mouth   – Earth Science
+    { pattern: /فيزياء/,             id: 193663 }, // Zaatareh – Physics
+    { pattern: /كيمياء/,             id: 192276 }, // Minwer  – Chemistry
+  ],
+};
+
+/* ═══════════════════════════════════════════════════════
    STATIC ENUMS (hardcoded — numeric IDs required by Bitrix24)
 ═══════════════════════════════════════════════════════ */
 const STATIC_ENUMS = {
@@ -871,6 +893,34 @@ class App {
     }
   }
 
+  /* ═══ ASSIGNEE RESOLUTION ═══ */
+  /**
+   * Returns the Bitrix24 user ID of the responsible person for a given subject.
+   * For the generic "Science" subject, it falls back to scanning the unit name
+   * for Arabic sub-discipline keywords (أحياء / علوم أرض / فيزياء / كيمياء).
+   *
+   * @param {string} subjectText  – Display text of the subject (e.g. "Math", "Science")
+   * @param {string} [unitText]   – Unit / chapter name (used only when subject is "Science")
+   * @returns {number|null}       – Bitrix24 user ID or null if no match
+   */
+  _resolveAssigneeId(subjectText, unitText) {
+    const subject = (subjectText || '').toLowerCase().trim();
+
+    // 1. Direct subject → person lookup
+    const directId = ASSIGNEE_MAP.bySubject[subject];
+    if (directId) return directId;
+
+    // 2. For the umbrella "Science" subject, inspect the unit name for Arabic keywords
+    if (subject === 'science') {
+      const unit = unitText || '';
+      for (const { pattern, id } of ASSIGNEE_MAP.byUnitKeyword) {
+        if (pattern.test(unit)) return id;
+      }
+    }
+
+    return null; // English, Arabic, or unknown subject — leave assignee unset
+  }
+
   /* ═══ SCHEDULING DATABASE & STORAGE CONTROLS ═══ */
   async checkScheduledTicketsTable() {
     if (!supabaseClient) {
@@ -1121,6 +1171,14 @@ class App {
         };
 
         const payload = creator._buildFields({ ids, values: job });
+
+        // Auto-assign responsible person based on subject (and unit name for Science)
+        const assigneeId = this._resolveAssigneeId(job.subject, job.unit);
+        if (assigneeId) {
+          payload['assignedById']        = assigneeId;
+          payload['ufCrm160_1755078076'] = assigneeId;
+        }
+
         console.log(`[SCHEDULED ENGINE] Submitting Bitrix24 payload:`, JSON.stringify(payload, null, 2));
 
         const res = await this.api.createItem(payload);
@@ -2117,8 +2175,16 @@ class App {
         };
 
         const payload = creator._buildFields({ ids, values });
+
+        // Auto-assign responsible person based on subject (and unit name for Science)
+        const assigneeId = this._resolveAssigneeId(subjectText, values.unit);
+        if (assigneeId) {
+          payload['assignedById']             = assigneeId;
+          payload['ufCrm160_1755078076']      = assigneeId;
+        }
+
         console.log(`Submitting payload for "${itemTypeObj.text || 'No Item Type'}" to Bitrix:`, JSON.stringify(payload, null, 2));
-        
+
         const res = await this.api.createItem(payload);
         const ticketId = res.result?.item?.id || res.result?.id || null;
 
