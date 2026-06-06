@@ -737,6 +737,10 @@ function toast(msg, type = 'info', ms = 4000) {
 ═══════════════════════════════════════════════════════ */
 class App {
   constructor() {
+    // Set theme from local storage
+    const savedTheme = localStorage.getItem('btx_theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', savedTheme);
+
     this.api = new BitrixAPI(WEBHOOK);
     this.dm  = null;
     this.val = null;
@@ -747,6 +751,9 @@ class App {
 
     this.savedRows     = []; 
     this.recentTickets = [];
+    this.scheduledTickets = [];
+    this.useDBScheduled = false;
+    this._schedulingSource = 'single';
     this._selectedRows = new Set();
     this._activeFilter = 'all';
     this._allResults   = [];
@@ -761,10 +768,38 @@ class App {
     // Connect to data manager
     await this._autoConnect(false);
     
-    // Load rows and recent tickets from Supabase (with localStorage fallback)
+    // Probe database for scheduled_tickets table
+    await this.checkScheduledTicketsTable();
+
+    // Load theme icon state
+    const savedTheme = localStorage.getItem('btx_theme') || 'dark';
+    this._updateThemeIconDisplay(savedTheme);
+
+    // Initialize Realtime subscription
+    if (supabaseClient) {
+      supabaseClient.channel('public:recent_tickets')
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'recent_tickets' }, payload => {
+          this._handleRealtimeRecentTickets(payload);
+        })
+        .subscribe();
+
+      if (this.useDBScheduled) {
+        supabaseClient.channel('public:scheduled_tickets')
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'scheduled_tickets' }, payload => {
+            this._handleRealtimeScheduled(payload);
+          })
+          .subscribe();
+      }
+    }
+
+    // Load rows, recent tickets, and scheduled tickets
     await this._loadSavedRowsFromSupabase();
     await this._loadRecentTicketsFromSupabase();
+    await this._loadScheduledTickets();
     
+    // Start background execution runner
+    this.startScheduler();
+
     // Bind Supabase Realtime channels
     this.initRealtime();
     this._checkAndRunAutoSync();
@@ -818,6 +853,422 @@ class App {
         this._handleRealtimeRecentTickets(payload);
       })
       .subscribe();
+  }
+
+  /* ═══ THEME CONTROLS ═══ */
+  _updateThemeIconDisplay(theme) {
+    const sun = document.querySelector('#themeToggleBtn .sun-ico');
+    const moon = document.querySelector('#themeToggleBtn .moon-ico');
+    if (sun && moon) {
+      if (theme === 'dark') {
+        sun.style.display = 'block';
+        moon.style.display = 'none';
+      } else {
+        sun.style.display = 'none';
+        moon.style.display = 'block';
+      }
+    }
+  }
+
+  /* ═══ SCHEDULING DATABASE & STORAGE CONTROLS ═══ */
+  async checkScheduledTicketsTable() {
+    if (!supabaseClient) {
+      this.useDBScheduled = false;
+      return;
+    }
+    try {
+      const { error } = await supabaseClient.from('scheduled_tickets').select('id').limit(1);
+      if (error && error.code === 'PGRST205') {
+        this.useDBScheduled = false;
+      } else {
+        this.useDBScheduled = true;
+      }
+    } catch (e) {
+      this.useDBScheduled = false;
+    }
+    console.log('Scheduled tickets database mode active:', this.useDBScheduled);
+  }
+
+  async _loadScheduledTickets() {
+    try {
+      if (this.useDBScheduled && supabaseClient) {
+        console.log('Loading scheduled tickets from Supabase...');
+        const { data, error } = await supabaseClient.from('scheduled_tickets').select('*').order('scheduled_at', { ascending: true });
+        if (error) throw error;
+        this.scheduledTickets = data || [];
+      } else {
+        const cached = localStorage.getItem('btx_scheduled_tickets');
+        this.scheduledTickets = cached ? JSON.parse(cached) : [];
+      }
+      this._renderScheduledTickets();
+    } catch (e) {
+      console.warn('Failed to load scheduled tickets:', e.message);
+    }
+  }
+
+  _renderScheduledTickets() {
+    const tbody = document.getElementById('scheduledBody');
+    const badge = document.getElementById('scheduledBadge');
+    if (!tbody) return;
+
+    const pendingCount = this.scheduledTickets.filter(t => t.status === 'pending').length;
+    if (badge) {
+      if (pendingCount > 0) {
+        badge.textContent = String(pendingCount);
+        badge.style.display = 'inline-block';
+      } else {
+        badge.style.display = 'none';
+      }
+    }
+
+    const term = document.getElementById('scheduledSearch')?.value.toLowerCase().trim();
+    const filtered = this.scheduledTickets.filter(t => {
+      if (!term) return true;
+      const matchStr = `${t.subject} ${t.grade} ${t.semester} ${t.unit || ''} ${t.lesson || ''} ${t.status}`.toLowerCase();
+      return matchStr.includes(term);
+    });
+
+    if (filtered.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--t3);padding:24px;">No scheduled tickets found.</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = '';
+    filtered.forEach((t, index) => {
+      const tr = document.createElement('tr');
+      tr.className = `r-${t.status}`;
+      
+      let statusClass = 'sb-ok';
+      if (t.status === 'pending') statusClass = 'sb-wrn';
+      else if (t.status === 'processing') statusClass = 'sb-ok';
+      else if (t.status === 'failed') statusClass = 'sb-err';
+      else if (t.status === 'completed') statusClass = 'sb-ok';
+
+      const formatTime = (isoString) => {
+        const date = new Date(isoString);
+        return date.toLocaleString();
+      };
+
+      const itemTypesText = (t.item_types || []).map(it => it.text).join(', ') || '—';
+      
+      let detailsHtml = '—';
+      if (t.status === 'completed' && t.notes) {
+        try {
+          const links = JSON.parse(t.notes);
+          detailsHtml = links.map(link => 
+            `<a href="https://spa.joacademy.com/page/content/ula_content_development/type/1440/details/${link.id}/" target="_blank" class="id-chip" style="text-decoration:none; margin-right:6px;">#${link.id}</a>`
+          ).join('');
+        } catch (e) {
+          detailsHtml = truncate(t.notes, 30);
+        }
+      } else if (t.status === 'failed') {
+        detailsHtml = `<span style="color:var(--err); font-weight:600;">${t.notes || 'Unknown error'}</span>`;
+      } else if (t.status === 'processing') {
+        detailsHtml = '<span style="color:var(--cyan); font-weight:600;"><div class="btn-spinner" style="border-color:var(--cyan);border-top-color:transparent;width:10px;height:10px;margin-right:6px;vertical-align:middle;"></div>Creating…</span>';
+      }
+
+      tr.innerHTML = `
+        <td class="td-num">${index + 1}</td>
+        <td>${formatTime(t.scheduled_at)}</td>
+        <td><strong>${t.subject}</strong> · Grade ${t.grade} · ${t.semester}<br><span style="font-size:11px;color:var(--t3);">${t.unit || '—'} / ${t.lesson || '—'}</span></td>
+        <td style="font-size:12px;">${itemTypesText}</td>
+        <td><span class="sbadge ${statusClass}">${t.status}</span></td>
+        <td class="td-msg" title="${t.notes || ''}">${detailsHtml}</td>
+        <td style="text-align: center;">
+          ${t.status === 'pending' ? `
+            <button class="sel-btn btn-run-now" style="padding:4px 8px; font-size:11px; margin-right:4px;">Run Now</button>
+            <button class="sel-btn btn-delete-sched sel-btn-clear" style="padding:4px 8px; font-size:11px;">Cancel</button>
+          ` : `
+            <button class="sel-btn btn-delete-sched sel-btn-clear" style="padding:4px 8px; font-size:11px;">Delete</button>
+          `}
+        </td>
+      `;
+
+      const runBtn = tr.querySelector('.btn-run-now');
+      if (runBtn) {
+        runBtn.addEventListener('click', () => this.runScheduledJobImmediately(t.id || t.temp_id));
+      }
+
+      tr.querySelector('.btn-delete-sched').addEventListener('click', () => this.deleteScheduledJob(t.id || t.temp_id));
+
+      tbody.appendChild(tr);
+    });
+  }
+
+  async deleteScheduledJob(id) {
+    if (!confirm('Are you sure you want to cancel/delete this scheduled job?')) return;
+    try {
+      if (this.useDBScheduled && supabaseClient) {
+        const { error } = await supabaseClient.from('scheduled_tickets').delete().eq('id', id);
+        if (error) throw error;
+      } else {
+        const cached = localStorage.getItem('btx_scheduled_tickets');
+        let jobs = cached ? JSON.parse(cached) : [];
+        jobs = jobs.filter(j => (j.id || j.temp_id) !== id);
+        localStorage.setItem('btx_scheduled_tickets', JSON.stringify(jobs));
+        this.scheduledTickets = jobs;
+        this._renderScheduledTickets();
+      }
+      toast('Scheduled job removed', 'info');
+      await this._loadScheduledTickets();
+    } catch (e) {
+      console.error('Failed to delete scheduled job:', e.message);
+      toast(`Error: ${e.message}`, 'error');
+    }
+  }
+
+  async clearAllScheduledJobs() {
+    if (!confirm('Are you sure you want to cancel ALL scheduled jobs?')) return;
+    try {
+      if (this.useDBScheduled && supabaseClient) {
+        const { error } = await supabaseClient.from('scheduled_tickets').delete().neq('id', 0);
+        if (error) throw error;
+      } else {
+        localStorage.removeItem('btx_scheduled_tickets');
+        this.scheduledTickets = [];
+        this._renderScheduledTickets();
+      }
+      toast('All scheduled jobs cancelled', 'info');
+      await this._loadScheduledTickets();
+    } catch (e) {
+      console.error('Failed to clear scheduled jobs:', e.message);
+      toast(`Error: ${e.message}`, 'error');
+    }
+  }
+
+  async runScheduledJobImmediately(id) {
+    const job = this.scheduledTickets.find(j => (j.id || j.temp_id) === id);
+    if (!job || job.status !== 'pending') return;
+    toast('Executing scheduled ticket now…', 'info');
+    
+    let canProceed = false;
+    if (this.useDBScheduled && supabaseClient) {
+      try {
+        const { data, error } = await supabaseClient.from('scheduled_tickets')
+          .update({ status: 'processing' })
+          .eq('id', id)
+          .eq('status', 'pending')
+          .select();
+        if (!error && data && data.length > 0) {
+          canProceed = true;
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    } else {
+      job.status = 'processing';
+      localStorage.setItem('btx_scheduled_tickets', JSON.stringify(this.scheduledTickets));
+      this._renderScheduledTickets();
+      canProceed = true;
+    }
+
+    if (canProceed) {
+      this.executeScheduledJob(job);
+    }
+  }
+
+  async executeScheduledJob(job) {
+    const idKey = job.id || job.temp_id;
+    try {
+      console.log('Background Executing scheduled job:', job);
+      
+      const resolveVal = (key, text) => {
+        if (!text) return null;
+        return this.dm.resolveId(key, text);
+      };
+
+      const subjectId  = resolveVal('subject', job.subject);
+      const gradeId    = resolveVal('grade', job.grade);
+      const semesterId = resolveVal('semester', job.semester);
+      
+      if (!subjectId || !gradeId || !semesterId) {
+        throw new Error(`Taxonomy values unresolved for Bitrix24: Subject "${job.subject}" -> ${subjectId}, Grade "${job.grade}" -> ${gradeId}, Semester "${job.semester}" -> ${semesterId}`);
+      }
+
+      const creator = new TicketCreator(this.api);
+      const typesToCreate = (job.item_types && job.item_types.length > 0) ? job.item_types : [{ id: null, text: '' }];
+      const createdTickets = [];
+
+      for (let index = 0; index < typesToCreate.length; index++) {
+        const itemTypeObj = typesToCreate[index];
+        
+        const ids = {
+          subject:  subjectId,
+          grade:    gradeId,
+          semester: semesterId,
+          itemType: itemTypeObj.id,
+          unit:     resolveVal('unit', job.unit),
+          lesson:   resolveVal('lesson', job.lesson),
+          domain:   resolveVal('domain', job.domain),
+          topic:    resolveVal('topic', job.topic),
+          outcome:  resolveVal('outcome', job.outcome),
+          skill:    resolveVal('skill', job.skill),
+        };
+
+        const payload = creator._buildFields({ ids, values: job });
+        console.log(`[SCHEDULED ENGINE] Submitting Bitrix24 payload:`, JSON.stringify(payload, null, 2));
+
+        const res = await this.api.createItem(payload);
+        const ticketId = res.result?.item?.id || res.result?.id || null;
+
+        let displayId = ticketId;
+
+        if (ticketId) {
+          const numericId = parseInt(ticketId);
+          console.log(`[SCHEDULED ENGINE] Workaround: Waiting 1.5s for cloning...`);
+          await sleep(1500);
+
+          const searchTitle = `ULA Content Development #${numericId}`;
+          let targetId = numericId;
+
+          try {
+            const searchRes = await this.api.call('crm.item.list', {
+              entityTypeId: ENTITY_TYPE,
+              filter: { "title": searchTitle }
+            });
+            const items = searchRes.result?.items || searchRes.result || [];
+            if (items.length > 0) {
+              targetId = parseInt(items[0].id);
+            } else {
+              targetId = numericId + 1;
+            }
+          } catch (searchErr) {
+            targetId = numericId + 1;
+          }
+
+          console.log(`[SCHEDULED ENGINE] Updating cloned ticket #${targetId}...`);
+          const updatePayload = {
+            [FIELDS.unit.id]: job.unit,
+            [FIELDS.lesson.id]: job.lesson,
+            [FIELDS.domain.id]: job.domain,
+            [FIELDS.topic.id]: job.topic,
+            [FIELDS.outcome.id]: job.outcome,
+            [FIELDS.skill.id]: job.skill
+          };
+
+          try {
+            await this.api.call('crm.item.update', {
+              entityTypeId: ENTITY_TYPE,
+              id: targetId,
+              fields: updatePayload
+            });
+            displayId = targetId;
+          } catch (updateErr) {
+            try {
+              await this.api.call('crm.item.update', {
+                entityTypeId: ENTITY_TYPE,
+                id: numericId,
+                fields: updatePayload
+              });
+            } catch (origErr) {
+              console.error('Update failed for both target and original.');
+            }
+          }
+
+          const displayIdStr = String(displayId);
+          createdTickets.push({ id: displayIdStr, typeText: itemTypeObj.text || '' });
+
+          this._addRecentId(displayIdStr);
+          this._addRecentTicketToSupabase(displayIdStr, job.subject, job.grade, job.semester);
+        }
+      }
+
+      if (createdTickets.length > 0) {
+        const notesVal = JSON.stringify(createdTickets);
+        if (this.useDBScheduled && supabaseClient) {
+          await supabaseClient.from('scheduled_tickets')
+            .update({ status: 'completed', notes: notesVal })
+            .eq('id', idKey);
+        } else {
+          const jobRef = this.scheduledTickets.find(j => (j.id || j.temp_id) === idKey);
+          if (jobRef) {
+            jobRef.status = 'completed';
+            jobRef.notes = notesVal;
+          }
+          localStorage.setItem('btx_scheduled_tickets', JSON.stringify(this.scheduledTickets));
+        }
+        
+        const ticketLinks = createdTickets.map(t => `#${t.id}`).join(', ');
+        toast(`[Scheduled] Successfully created ticket(s): ${ticketLinks}!`, 'success', 6000);
+      } else {
+        throw new Error('No tickets created.');
+      }
+
+    } catch (e) {
+      console.error('[SCHEDULED ENGINE] Job execution failed:', e.message);
+      if (this.useDBScheduled && supabaseClient) {
+        await supabaseClient.from('scheduled_tickets')
+          .update({ status: 'failed', notes: e.message })
+          .eq('id', idKey);
+      } else {
+        const jobRef = this.scheduledTickets.find(j => (j.id || j.temp_id) === idKey);
+        if (jobRef) {
+          jobRef.status = 'failed';
+          jobRef.notes = e.message;
+        }
+        localStorage.setItem('btx_scheduled_tickets', JSON.stringify(this.scheduledTickets));
+      }
+      toast(`[Scheduled] Ticket creation failed: ${e.message}`, 'error', 6000);
+    } finally {
+      await this._loadScheduledTickets();
+    }
+  }
+
+  startScheduler() {
+    console.log('Background Scheduled Ticket Runner started.');
+    setInterval(async () => {
+      const now = new Date();
+      const dueJobs = this.scheduledTickets.filter(j => j.status === 'pending' && new Date(j.scheduled_at) <= now);
+      
+      for (const job of dueJobs) {
+        let canProceed = false;
+        const idKey = job.id || job.temp_id;
+        if (this.useDBScheduled && supabaseClient) {
+          try {
+            const { data, error } = await supabaseClient.from('scheduled_tickets')
+               .update({ status: 'processing' })
+               .eq('id', idKey)
+               .eq('status', 'pending')
+               .select();
+            if (!error && data && data.length > 0) {
+              canProceed = true;
+            }
+          } catch (err) {
+            console.error('Locking error:', err);
+          }
+        } else {
+          job.status = 'processing';
+          localStorage.setItem('btx_scheduled_tickets', JSON.stringify(this.scheduledTickets));
+          this._renderScheduledTickets();
+          canProceed = true;
+        }
+
+        if (canProceed) {
+          this.executeScheduledJob(job);
+        }
+      }
+    }, 10000);
+  }
+
+  _handleRealtimeScheduled(payload) {
+    const { eventType, new: newRec, old: oldRec } = payload;
+    if (eventType === 'INSERT') {
+      const exists = this.scheduledTickets.some(t => t.id === newRec.id);
+      if (!exists) {
+        this.scheduledTickets.push(newRec);
+        this.scheduledTickets.sort((a,b) => new Date(a.scheduled_at) - new Date(b.scheduled_at));
+        this._renderScheduledTickets();
+      }
+    } else if (eventType === 'DELETE') {
+      this.scheduledTickets = this.scheduledTickets.filter(t => t.id !== oldRec.id);
+      this._renderScheduledTickets();
+    } else if (eventType === 'UPDATE') {
+      const idx = this.scheduledTickets.findIndex(t => t.id === newRec.id);
+      if (idx !== -1) {
+        this.scheduledTickets[idx] = newRec;
+        this._renderScheduledTickets();
+      }
+    }
   }
 
   /* ═══ DB SYNC OPERATIONS ═══ */
@@ -1360,6 +1811,60 @@ class App {
       localStorage.removeItem(LS_RECENT);
       $('ctRecent').style.display = 'none';
     });
+
+    /* Theme toggle */
+    $('themeToggleBtn').addEventListener('click', () => {
+      const currTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+      const newTheme = currTheme === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', newTheme);
+      localStorage.setItem('btx_theme', newTheme);
+      this._updateThemeIconDisplay(newTheme);
+      toast(`Switched to ${newTheme} mode!`, 'info');
+    });
+
+    /* Scheduling modal triggers */
+    $('ctScheduleOpenBtn').addEventListener('click', () => {
+      const subject = $('fSubject').value;
+      const grade = $('fGrade').value;
+      const semester = $('fSemester').value;
+      if (!subject || !grade || !semester) {
+        toast('Subject, Grade, and Semester are required to schedule.', 'error');
+        return;
+      }
+      this._schedulingSource = 'single';
+      $('fModalScheduleTime').value = '';
+      $('scheduleModalOverlay').style.display = 'flex';
+      
+      const nowStr = new Date(new Date().getTime() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+      $('fModalScheduleTime').min = nowStr;
+    });
+
+    $('bulkScheduleOpenBtn').addEventListener('click', () => {
+      const toSchedule = this.savedRows.filter(r => this._selectedRows.has(r.rowNum));
+      if (!toSchedule.length) {
+        toast('No rows selected to schedule.', 'error');
+        return;
+      }
+      this._schedulingSource = 'bulk';
+      $('fModalScheduleTime').value = '';
+      $('scheduleModalOverlay').style.display = 'flex';
+      
+      const nowStr = new Date(new Date().getTime() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+      $('fModalScheduleTime').min = nowStr;
+    });
+
+    $('closeScheduleModal').addEventListener('click', () => $('scheduleModalOverlay').style.display = 'none');
+    $('cancelScheduleModal').addEventListener('click', () => $('scheduleModalOverlay').style.display = 'none');
+    $('confirmScheduleBtn').addEventListener('click', () => this._submitSchedule());
+
+    $('refreshScheduledBtn').addEventListener('click', () => {
+      const ico = $('refreshScheduledBtn').querySelector('.sync-ico');
+      ico.classList.add('spinning');
+      this._loadScheduledTickets().finally(() => ico.classList.remove('spinning'));
+    });
+    $('clearScheduledBtn').addEventListener('click', () => this.clearAllScheduledJobs());
+    $('scheduledSearch').addEventListener('input', () => this._renderScheduledTickets());
+
     /* Cascading Dropdowns for Unit and Lesson */
     $('fSubject').addEventListener('change',  () => this._updateUnitDropdown());
     $('fGrade').addEventListener('change',    () => this._updateUnitDropdown());
@@ -1499,6 +2004,15 @@ class App {
     });
 
     $('clearLessonsBtn').addEventListener('click', () => this._clearAllLessons());
+
+    const dsi = $('deleteSheetInput');
+    $('deleteSheetBtn').addEventListener('click', () => {
+      dsi.value = '';
+      dsi.click();
+    });
+    dsi.addEventListener('change', e => {
+      if (e.target.files[0]) this._handleDeleteFromSheet(e.target.files[0]);
+    });
   }
 
   /* ═══ TAB SWITCHING ═══ */
@@ -1509,6 +2023,8 @@ class App {
     
     if (tab === 'lessons') {
       this._loadLessonsFromSupabase();
+    } else if (tab === 'scheduled') {
+      this._loadScheduledTickets();
     }
   }
 
@@ -2514,6 +3030,276 @@ class App {
       if (btn) {
         btn.disabled = false;
         btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg> Clear All Lessons`;
+      }
+    }
+  }
+
+  async _handleDeleteFromSheet(file) {
+    if (!supabaseClient) {
+      toast('Supabase client not active. Offline mode.', 'error');
+      return;
+    }
+    const btn = document.getElementById('deleteSheetBtn');
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<div class="btn-spinner" style="border-color:var(--err);border-top-color:transparent;display:inline-block;width:12px;height:12px;margin-right:6px;"></div> Parsing…`;
+    }
+    try {
+      const { headers, rows } = await ExcelHandler.parse(file);
+      const mapping = this._autoMap(headers);
+      
+      const getVal = (row, key) => {
+        const idx = mapping[key];
+        return idx != null ? String(row[idx] ?? '').trim() : '';
+      };
+
+      const sheetRows = rows.map(row => ({
+        subject: getVal(row, 'subject'),
+        grade: getVal(row, 'grade'),
+        semester: getVal(row, 'semester'),
+        unit: getVal(row, 'unit'),
+        lesson: getVal(row, 'lesson'),
+        skill: getVal(row, 'skill')
+      })).filter(r => r.subject && r.grade && r.semester);
+
+      if (sheetRows.length === 0) {
+        toast('No valid rows with Subject, Grade, and Semester found in sheet.', 'error');
+        return;
+      }
+
+      if (btn) {
+        btn.innerHTML = `<div class="btn-spinner" style="border-color:var(--err);border-top-color:transparent;display:inline-block;width:12px;height:12px;margin-right:6px;"></div> Comparing…`;
+      }
+
+      const { data: dbRecords, error: fetchErr } = await supabaseClient.from('hierarchy').select('*');
+      if (fetchErr) throw fetchErr;
+
+      if (!dbRecords || dbRecords.length === 0) {
+        toast('No taxonomy records found in database to delete.', 'info');
+        return;
+      }
+
+      const matchedIds = [];
+      const matchedRecords = [];
+
+      for (const rec of dbRecords) {
+        const hasMatch = sheetRows.some(sr => {
+          const subjectMatch = sr.subject.toLowerCase() === (rec.subject || '').toLowerCase();
+          const gradeMatch = sr.grade.toLowerCase() === (rec.grade || '').toLowerCase();
+          
+          const semA = sr.semester.toLowerCase();
+          const semB = (rec.semester || '').toLowerCase();
+          const semesterMatch = semA === semB || 
+                                (SEMESTER_ALIASES[semA] != null && SEMESTER_ALIASES[semA] === SEMESTER_ALIASES[semB]) ||
+                                (SEMESTER_ALIASES[semA] != null && String(SEMESTER_ALIASES[semA]) === semB) ||
+                                (SEMESTER_ALIASES[semB] != null && String(SEMESTER_ALIASES[semB]) === semA);
+
+          const unitMatch = sr.unit.toLowerCase() === (rec.unit || '').toLowerCase();
+          const lessonMatch = sr.lesson.toLowerCase() === (rec.lesson || '').toLowerCase();
+          const skillMatch = sr.skill.toLowerCase() === (rec.skill || '').toLowerCase();
+
+          return subjectMatch && gradeMatch && semesterMatch && unitMatch && lessonMatch && skillMatch;
+        });
+
+        if (hasMatch) {
+          matchedIds.push(rec.id);
+          matchedRecords.push(rec);
+        }
+      }
+
+      if (matchedIds.length === 0) {
+        toast('No matching database records found for the rows in this sheet.', 'info');
+        return;
+      }
+
+      if (!confirm(`Found ${matchedIds.length} matching entries in the database. Are you sure you want to delete them?`)) {
+        return;
+      }
+
+      if (btn) {
+        btn.innerHTML = `<div class="btn-spinner" style="border-color:var(--err);border-top-color:transparent;display:inline-block;width:12px;height:12px;margin-right:6px;"></div> Deleting…`;
+      }
+
+      const { error: deleteErr } = await supabaseClient.from('hierarchy').delete().in('id', matchedIds);
+      if (deleteErr) throw deleteErr;
+
+      if (this.dm) {
+        for (const rec of matchedRecords) {
+          const subject = rec.subject;
+          const grade = rec.grade;
+          const semester = rec.semester;
+          const unit = rec.unit;
+          const lesson = rec.lesson;
+          const skill = rec.skill;
+
+          if (this.dm.tree[subject]?.[grade]?.[semester]?.[unit]) {
+            const lessonsMap = this.dm.tree[subject][grade][semester][unit];
+            if (lessonsMap[lesson]) {
+              if (skill) {
+                lessonsMap[lesson].delete(skill);
+                if (lessonsMap[lesson].size === 0) {
+                  delete lessonsMap[lesson];
+                }
+              } else {
+                delete lessonsMap[lesson];
+              }
+              if (Object.keys(lessonsMap).length === 0) {
+                delete this.dm.tree[subject][grade][semester][unit];
+              }
+            }
+          }
+        }
+        this.dm.saveCache();
+      }
+
+      toast(`Successfully deleted ${matchedIds.length} matching entries!`, 'success');
+      await this._loadLessonsFromSupabase();
+      this._updateUnitDropdown();
+
+    } catch (e) {
+      console.error('Failed to delete entries from sheet:', e.message);
+      toast(`Error: ${e.message}`, 'error');
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg> Delete from Sheet`;
+      }
+    }
+  }
+
+  /* ═══ SUBMIT SCHEDULE LOGIC ═══ */
+  async _submitSchedule() {
+    const $ = id => document.getElementById(id);
+    const selectedTime = $('fModalScheduleTime').value;
+    if (!selectedTime) {
+      toast('Please select a date and time.', 'error');
+      return;
+    }
+    const scheduleDate = new Date(selectedTime);
+    if (scheduleDate <= new Date()) {
+      toast('Please choose a future date and time.', 'error');
+      return;
+    }
+
+    const isoTime = scheduleDate.toISOString();
+    $('scheduleModalOverlay').style.display = 'none';
+
+    if (this._schedulingSource === 'single') {
+      const values = {
+        subject:  $('fSubject').value ? ($('fSubject').options[$('fSubject').selectedIndex]?.text || '') : '',
+        grade:    $('fGrade').value ? ($('fGrade').options[$('fGrade').selectedIndex]?.text || '') : '',
+        semester: $('fSemester').value ? ($('fSemester').options[$('fSemester').selectedIndex]?.text || '') : '',
+        unit:     $('fUnit').value.trim(),
+        lesson:   $('fLesson').value.trim(),
+        domain:   $('fDomain').value.trim(),
+        topic:    $('fTopic').value.trim(),
+        outcome:  $('fOutcome').value.trim(),
+        skill:    $('fSkill').value.trim(),
+      };
+
+      const checkedChks = Array.from(document.querySelectorAll('.f-item-type-chk:checked'));
+      const checkedTypes = checkedChks.map(c => ({
+        id: parseInt(c.value),
+        text: c.dataset.text
+      }));
+
+      const job = {
+        scheduled_at: isoTime,
+        status: 'pending',
+        subject: values.subject,
+        grade: values.grade,
+        semester: values.semester,
+        unit: values.unit,
+        lesson: values.lesson,
+        domain: values.domain,
+        topic: values.topic,
+        outcome: values.outcome,
+        skill: values.skill,
+        item_types: checkedTypes,
+        notes: '',
+        temp_id: Math.random().toString(36).substr(2, 9)
+      };
+
+      try {
+        if (this.useDBScheduled && supabaseClient) {
+          // In DB mode, we don't send temp_id
+          const dbJob = { ...job };
+          delete dbJob.temp_id;
+          const { error } = await supabaseClient.from('scheduled_tickets').insert(dbJob);
+          if (error) throw error;
+        } else {
+          const cached = localStorage.getItem('btx_scheduled_tickets');
+          const jobs = cached ? JSON.parse(cached) : [];
+          jobs.push(job);
+          localStorage.setItem('btx_scheduled_tickets', JSON.stringify(jobs));
+        }
+        toast('Ticket scheduled successfully!', 'success');
+        this._clearForm();
+        await this._loadScheduledTickets();
+        this._switchTab('scheduled');
+      } catch (e) {
+        console.error('Failed to save schedule:', e.message);
+        toast(`Failed to schedule: ${e.message}`, 'error');
+      }
+    } else if (this._schedulingSource === 'bulk') {
+      const toSchedule = this.savedRows.filter(r => this._selectedRows.has(r.rowNum));
+      const jobs = toSchedule.map(r => {
+        const itemType = r.values?.itemType || '';
+        const resolvedItemTypeId = this.dm.resolveId('itemType', itemType);
+        const itemTypesArray = resolvedItemTypeId ? [{ id: resolvedItemTypeId, text: itemType }] : [];
+
+        const jobItem = {
+          scheduled_at: isoTime,
+          status: 'pending',
+          subject: r.values?.subject || '',
+          grade: r.values?.grade || '',
+          semester: r.values?.semester || '',
+          unit: r.values?.unit || '',
+          lesson: r.values?.lesson || '',
+          domain: r.values?.domain || '',
+          topic: r.values?.topic || '',
+          outcome: r.values?.outcome || '',
+          skill: r.values?.skill || '',
+          item_types: itemTypesArray,
+          notes: '',
+          temp_id: Math.random().toString(36).substr(2, 9)
+        };
+        
+        if (this.useDBScheduled) {
+          delete jobItem.temp_id;
+        }
+        return jobItem;
+      });
+
+      try {
+        if (this.useDBScheduled && supabaseClient) {
+          const { error } = await supabaseClient.from('scheduled_tickets').insert(jobs);
+          if (error) throw error;
+        } else {
+          const cached = localStorage.getItem('btx_scheduled_tickets');
+          const currentJobs = cached ? JSON.parse(cached) : [];
+          currentJobs.push(...jobs);
+          localStorage.setItem('btx_scheduled_tickets', JSON.stringify(currentJobs));
+        }
+
+        if (supabaseClient) {
+          const idsToDelete = toSchedule.map(r => r.id).filter(id => id != null);
+          if (idsToDelete.length > 0) {
+            await supabaseClient.from('saved_rows').delete().in('id', idsToDelete);
+          }
+        }
+        const scheduledNums = new Set(toSchedule.map(r => r.rowNum));
+        this.savedRows = this.savedRows.filter(r => !scheduledNums.has(r.rowNum));
+        this._selectedRows.clear();
+        this._persistRows();
+        this._renderSavedRows();
+
+        toast(`Scheduled ${jobs.length} row(s) successfully!`, 'success');
+        await this._loadScheduledTickets();
+        this._switchTab('scheduled');
+      } catch (e) {
+        console.error('Failed to schedule bulk rows:', e.message);
+        toast(`Failed to schedule bulk: ${e.message}`, 'error');
       }
     }
   }
