@@ -703,6 +703,30 @@ class TicketCreator {
         }
       }
     }
+    // 3-letter abbreviations for each item type
+    const ITEM_TYPE_ABBR = {
+      'recall':                          'RCL',
+      'introduction - video':            'ITV',
+      'introduction - presentation':     'ITP',
+      'information - video':             'INV',
+      'information - presentation':      'INP',
+      'implementation - situation':      'IMS',
+      'implementation - drill and practice': 'IDP',
+      'integration':                     'ITG',
+      'evaluation':                      'EVL',
+    };
+    // Set Bitrix24 item title to: "skill name | ITEM_ABBR"
+    const skillVal    = values?.skill     ? String(values.skill).trim()     : '';
+    const itemTypeRaw = values?.itemType  ? String(values.itemType).trim()  : '';
+    const itemAbbr    = ITEM_TYPE_ABBR[itemTypeRaw.toLowerCase()] || itemTypeRaw.slice(0, 3).toUpperCase() || '';
+    const titleParts  = [skillVal, itemAbbr].filter(Boolean);
+    if (titleParts.length) {
+      out['title'] = titleParts.join(' | ');
+    } else {
+      // Fallback: build title from subject / grade / semester
+      const parts = [values?.subject, values?.grade, values?.semester].filter(Boolean);
+      out['title'] = parts.join(' - ') || 'Untitled';
+    }
     return out;
   }
 
