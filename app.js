@@ -1194,7 +1194,7 @@ class App {
           skill:    resolveVal('skill', job.skill),
         };
 
-        const payload = creator._buildFields({ ids, values: job });
+        const payload = creator._buildFields({ ids, values: { ...job, itemType: itemTypeObj.text || '' } });
 
         // Auto-assign responsible person based on subject (and unit name for Science)
         const assigneeId = this._resolveAssigneeId(job.subject, job.unit);
@@ -2198,7 +2198,7 @@ class App {
           skill:    this.dm.resolveId('skill', values.skill),
         };
 
-        const payload = creator._buildFields({ ids, values });
+        const payload = creator._buildFields({ ids, values: { ...values, itemType: itemTypeObj.text || '' } });
 
         // Auto-assign responsible person based on subject (and unit name for Science)
         const assigneeId = this._resolveAssigneeId(subjectText, values.unit);
