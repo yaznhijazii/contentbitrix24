@@ -757,6 +757,7 @@ class App {
     this._selectedRows = new Set();
     this._activeFilter = 'all';
     this._allResults   = [];
+    this._runningJobs  = new Set(); // guard against re-entrant scheduler ticks
   }
 
   /* ═══ BOOT ═══ */
@@ -878,13 +879,27 @@ class App {
     }
     try {
       const { error } = await supabaseClient.from('scheduled_tickets').select('id').limit(1);
-      if (error && error.code === 'PGRST205') {
-        this.useDBScheduled = false;
+      if (error) {
+        // Table doesn't exist or is inaccessible — codes vary by PostgREST/Supabase version:
+        // 42P01 = undefined_table (PostgreSQL), PGRST200/PGRST116/404 HTTP = relation not found
+        const code = String(error.code || '');
+        const msg  = String(error.message || '').toLowerCase();
+        const isNotFound =
+          code === '42P01' ||
+          code.startsWith('PGRST') ||
+          msg.includes('relation') ||
+          msg.includes('does not exist') ||
+          msg.includes('not found');
+        this.useDBScheduled = !isNotFound;
+        if (!this.useDBScheduled) {
+          console.warn('[Scheduler] scheduled_tickets table not found — falling back to localStorage.', error.message);
+        }
       } else {
         this.useDBScheduled = true;
       }
     } catch (e) {
       this.useDBScheduled = false;
+      console.warn('[Scheduler] Could not probe scheduled_tickets table:', e.message);
     }
     console.log('Scheduled tickets database mode active:', this.useDBScheduled);
   }
@@ -1218,25 +1233,34 @@ class App {
     console.log('Background Scheduled Ticket Runner started.');
     setInterval(async () => {
       const now = new Date();
-      const dueJobs = this.scheduledTickets.filter(j => j.status === 'pending' && new Date(j.scheduled_at) <= now);
-      
+      const dueJobs = this.scheduledTickets.filter(
+        j => j.status === 'pending' && new Date(j.scheduled_at) <= now
+      );
+
       for (const job of dueJobs) {
-        let canProceed = false;
         const idKey = job.id || job.temp_id;
+
+        // Re-entrancy guard: skip if this job is already running in this tab
+        if (this._runningJobs.has(idKey)) continue;
+
+        let canProceed = false;
+
         if (this.useDBScheduled && supabaseClient) {
           try {
             const { data, error } = await supabaseClient.from('scheduled_tickets')
-               .update({ status: 'processing' })
-               .eq('id', idKey)
-               .eq('status', 'pending')
-               .select();
+              .update({ status: 'processing' })
+              .eq('id', idKey)
+              .eq('status', 'pending')
+              .select();
             if (!error && data && data.length > 0) {
               canProceed = true;
             }
           } catch (err) {
-            console.error('Locking error:', err);
+            console.error('[Scheduler] Locking error for job', idKey, err);
           }
         } else {
+          // In localStorage mode, guard against the same job running twice across ticks
+          if (job.status !== 'pending') continue;
           job.status = 'processing';
           localStorage.setItem('btx_scheduled_tickets', JSON.stringify(this.scheduledTickets));
           this._renderScheduledTickets();
@@ -1244,7 +1268,8 @@ class App {
         }
 
         if (canProceed) {
-          this.executeScheduledJob(job);
+          this._runningJobs.add(idKey);
+          this.executeScheduledJob(job).finally(() => this._runningJobs.delete(idKey));
         }
       }
     }, 10000);
