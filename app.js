@@ -40,14 +40,14 @@ const ASSIGNEE_MAP = {
   bySubject: {
     'math':         163546, // Ibrahim
     'biology':      163545, // Ranya
-    'earth science': 21921, // Mouth
+    'earth science': 192276, // Munawwar
     'physics':      193663, // Zaatareh
     'chemistry':    192276, // Minwer
   },
   // Fallback: scan unit text for Arabic sub-subject keywords (used when subject = "Science")
   byUnitKeyword: [
     { pattern: /أحياء/,              id: 163545 }, // Ranya   – Biology
-    { pattern: /علوم\s*أرض|أرض/,    id: 21921  }, // Mouth   – Earth Science
+    { pattern: /علوم\s*أرض|أرض/,    id: 192276 }, // Munawwar – Earth Science
     { pattern: /فيزياء/,             id: 193663 }, // Zaatareh – Physics
     { pattern: /كيمياء/,             id: 192276 }, // Minwer  – Chemistry
   ],
